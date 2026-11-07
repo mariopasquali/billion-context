@@ -240,8 +240,8 @@ test("opencode msgids: a single-flight-blocked turn does not burn its ids (#4491
     assert.deepEqual(body2.msgIds, ["msg_a1", "msg_u2"], "blocked attempt did not burn the delta ids");
 });
 
-// ── #5743 redo: REAL host ids from both seams (V2 "context" event shapes,
-// tool sessions, the #5741 repeated-prompt scenario). The host message
+// ── #5743: shared harvest matching against structured host message shapes,
+// tool sessions, and the #5741 repeated-prompt scenario. The host message
 // shapes below mirror live 2.0.4 captures (anthropic provider): role
 // user/assistant/tool, content parts text / tool-call / tool-result.
 
@@ -249,12 +249,12 @@ function ctxMessage(id: string, role: string, content: unknown[]): { id: string;
     return { id, role, content };
 }
 
-/** Simulate one `ctx.session.hook("context")` fire (V2 seam). */
+/** Populate the shared harvest store directly; not a V2 hook-registration test. */
 function fireContext(sid: string, messages: unknown[]): void {
     harvestOpencodeMsgIds(sid, messages);
 }
 
-test("opencode msgids: V2 context seam carries real ids through a TOOL session", async () => {
+test("opencode msgids: shared host harvest carries real ids through a TOOL session", async () => {
     __resetIncrementalClientForTests();
     __resetOpencodeIncrementalForTests();
     __resetOpencodeMsgIdsForTests();
@@ -278,9 +278,8 @@ test("opencode msgids: V2 context seam carries real ids through a TOOL session",
             { type: "tool_result", tool_use_id: "toolu_1", content: "{\"error\":{}}", is_error: true, cache_control: { type: "ephemeral" } },
         ] },
     ] }, sid);
-    // NOTE: fired BEFORE the request assembled — order inside the handler:
-    // context first, http.request after; the seed below replans against this
-    // latest fire exactly like the live hook does.
+    // Populate the shared harvest store before planning the request. V2's
+    // same-event stamping is exercised separately by the V2/native tests.
     fireContext(sid, [
         ctxMessage("msg_vu1", "user", [{ type: "text", text: "read README.md" }]),
         ctxMessage("msg_va1", "assistant", [

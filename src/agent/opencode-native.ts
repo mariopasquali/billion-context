@@ -679,8 +679,8 @@ function lastSessionFromMessages(messages: unknown): string | undefined {
 }
 
 /** #4491 host wiring: harvest host message ids per LLM request from the V1
- *  messages.transform hook (V2 hosts instead feed the same store from the
- *  "context" seam registered in createOpencodeV2Setup). Never mutates the
+ *  messages.transform hook (V2 hosts instead stamp ids from the same
+ *  http.request event in createOpencodeV2Setup). Never mutates the
  *  host's messages. */
 const harvestMsgIdsTransform = async (input: unknown, output: { messages?: unknown }): Promise<void> => {
     harvestOpencodeMsgIds(lastSessionFromMessages(output?.messages), output?.messages);

@@ -50,9 +50,9 @@
 
 import { randomUUID } from "node:crypto";
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
+import { stampedMsgIdsHeaderFromMessages } from "./opencode-v2-msgids.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
-import { harvestOpencodeMsgIds } from "./opencode-msgids.js";
 import { logHostEvent } from "./host-log.js";
 
 // OpenCode V2 TUI renders a synthetic message as a visible Notice row only when its display text fits the
@@ -335,6 +335,13 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             // instruction drift (AGENTS.md reconcile) must not fork the
             // compression session.
             headers.set("x-bili-plugin-instructions-mutable", "1");
+            // #5825: host msgIds on the V2 wire. Read from THIS event's
+            // structured message list (the very payload this turn sends —
+            // ids ride only when every one carries a usable host id, else no
+            // header); the server re-proves exact count parity vs the wire
+            // before trusting them, so drift degrades instead of misaligning.
+            const msgIdsHeader = stampedMsgIdsHeaderFromMessages(e.messages);
+            if (msgIdsHeader !== undefined) headers.set("x-bili-msg-ids", msgIdsHeader);
             // #1699: forward the host's per-request persona so the proxy can classify
             // side requests by intent — opencode v2 title-gen carries no max_tokens, so
             // the budget heuristic alone can never see it. Stamped for every non-empty
@@ -415,27 +422,11 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
         const hookReg = await ctx.session?.hook?.("http.request", httpRequestHook);
         if (hookReg) registrations.push(hookReg);
 
-        // #4491 host wiring (V2 seam): harvest the host message ids from the
-        // "context" event — it fires immediately before EVERY provider request
-        // assembly carrying the full { id, role, content }[] conversation plus
-        // sessionID (verified live on 2.0.4, anthropic + openai-compatible
-        // providers alike). With a same-cycle harvest in place, the native
-        // planner can ride real host ids on incremental turns (#5743) instead
-        // of degrading to content-derived identities. Hosts without the seam
-        // keep today's id-less degradation — never fail startup over it.
-        try {
-            const ctxReg = await ctx.session?.hook?.("context", (ev) => {
-                try {
-                    const e = ev as unknown as { sessionID?: unknown; messages?: unknown };
-                    harvestOpencodeMsgIds(typeof e.sessionID === "string" ? e.sessionID : undefined, e.messages);
-                } catch {
-                    // harvest is best-effort only
-                }
-            });
-            if (ctxReg) registrations.push(ctxReg);
-        } catch {
-            // no "context" seam on this build → id-less turns (documented degrade)
-        }
+        // #5825: the `http.request` payload itself carries the structured turn
+        // (event.messages with host ids) — extraction lives in stampHeaders
+        // above, same event, so there is deliberately NO separate `context`
+        // hook here (that seam fired pre-request in older builds and could
+        // race the wire; reading this event can't).
 
         if (options.onResponse !== undefined) {
             const onResponse = options.onResponse;

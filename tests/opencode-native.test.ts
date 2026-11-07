@@ -267,9 +267,9 @@ test("setup(route): header stamping applies to the REPLACED request, tools regis
     };
     const setup = createOpencodeV2Setup({ route: createNativeRoute(state, { probe: async () => true }) });
     const cleanup = await setup(ctx);
-    // Two "context" hooks: first the #5743 host-id harvest (registered with
-    // http.request), second the report-id filter in the [context,…] loop.
-    assert.deepEqual(hooks.map((h) => h.name), ["http.request", "context", "experimental.ws.handshake", "context", "compaction", "title", "generate"]);
+    // V2 IDs come from the same http.request event (#5825); the only
+    // context hook is the report-id filter, with no separate ID harvest.
+    assert.deepEqual(hooks.map((h) => h.name), ["http.request", "experimental.ws.handshake", "context", "compaction", "title", "generate"]);
     assert.deepEqual(tools.sort(), [...EXPECTED_TOOLS].sort());
     const e: V2HttpRequestEvent = {
         sessionID: "ses_abc",
