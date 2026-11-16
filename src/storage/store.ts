@@ -219,6 +219,77 @@ export interface RefRow {
     refNum: number | null;
 }
 
+/** #5599 prototype: markers left in the hot sessions row once the bag lives
+ *  in side tables. Readers of the row (getSessionRow, getCcr, metadata
+ *  readers) assemble the exact original JSON from the side tables. */
+export const SPLIT_CCR_MARKER = '{"$split":"ccr-v1"}';
+export const SPLIT_METADATA_MARKER = '{"$split":"metadata-v1"}';
+
+export const PROTO_5599_DDL = `
+CREATE TABLE IF NOT EXISTS ccr_bodies (
+    session_id      TEXT NOT NULL,
+    body_hash       TEXT NOT NULL,
+    ord             INTEGER NOT NULL,
+    content_hash    TEXT NOT NULL REFERENCES content(hash),
+    PRIMARY KEY (session_id, body_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_ccr_bodies_content_hash ON ccr_bodies(content_hash);
+CREATE TABLE IF NOT EXISTS session_metadata (
+    session_id      TEXT NOT NULL,
+    key             TEXT NOT NULL,
+    parent          TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    ord             INTEGER NOT NULL,
+    kind            TEXT NOT NULL,
+    value_json      TEXT,
+    PRIMARY KEY (session_id, key)
+);
+CREATE TABLE IF NOT EXISTS session_metadata_items (
+    session_id      TEXT NOT NULL,
+    key             TEXT NOT NULL,
+    item            TEXT NOT NULL,
+    ord             INTEGER NOT NULL,
+    value_json      TEXT NOT NULL,
+    PRIMARY KEY (session_id, key, item)
+);
+`;
+
+/** One CCR original body (contentStore.byHash entry). */
+export interface CcrBodyRow {
+    ord: number;
+    hash: string;
+    text: string;
+}
+
+/** One metadata node. key = JSON path of the node, parent = JSON path of
+ *  the enclosing node ("" = the metadata object itself), name = own key.
+ *  kind "v": value_json holds the whole value; "n": a small object whose
+ *  children are nodes; "a"/"o": a large array/object whose elements live as
+ *  item rows (arrays keyed by absolute position, so appends and head drops
+ *  touch only the affected rows). */
+export interface MetadataTopRow {
+    key: string;
+    parent: string;
+    name: string;
+    ord: number;
+    kind: "v" | "n" | "a" | "o";
+    valueJson: string | null;
+    items: { item: string; ord: number; valueJson: string }[];
+}
+
+interface StoredMetadataItem {
+    key: string;
+    item: string;
+    ord: number;
+    value_json: string;
+}
+
+interface MetadataItemStatements {
+    delItems: { run(...args: unknown[]): unknown };
+    delItem: { run(...args: unknown[]): unknown };
+    upItem: { run(...args: unknown[]): unknown };
+}
+
 export interface CcrEntryRow {
     ord: number;
     key: string;
@@ -339,6 +410,10 @@ export interface IngestSessionInput {
     deadRefs: { ord: number; ref: string; refNum: number; recordedAt: number }[];
     refs: RefRow[];
     ccrEntries: CcrEntryRow[];
+    /** #5599 prototype: present when session.ccrJson is SPLIT_CCR_MARKER. */
+    ccrBodies?: CcrBodyRow[];
+    /** #5599 prototype: present when session.metadataJson is SPLIT_METADATA_MARKER. */
+    metadataRows?: MetadataTopRow[];
     /** Plan-space pointer sequences (indices into `messages`), if the caller
      *  has them. ingestSession rewrites both the rows and these pointers to
      *  absolute seqs before insert — see remapPlanSeqs. */
@@ -676,6 +751,7 @@ export class UnifiedStore {
                 db.exec(pragma);
             }
             migrateSchema(db);
+            db.exec(PROTO_5599_DDL);
         } catch (err) {
             // The handle we just opened must not leak when the file turns out
             // to be corrupt: the #2771 fallback tells operators to MOVE the
@@ -1517,10 +1593,212 @@ export class UnifiedStore {
                     .prepare("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)")
                     .run(s.sessionId, e.ord, e.key, hash);
             }
+            this.writeSplitBags(s.sessionId, input);
             return true;
         });
         if (ok) this.maybeCheckpointWal();
         return ok;
+    }
+
+    /** #5599 prototype: diff-write CCR bodies and metadata rows. Unchanged
+     *  rows are not touched, so a turn writes only what changed. */
+    private writeSplitBags(sessionId: string, input: IngestSessionInput): void {
+        if (input.ccrBodies || input.session.ccrJson === null) {
+            const incoming = new Map<string, CcrBodyRow>();
+            for (const b of input.ccrBodies ?? []) incoming.set(b.hash, b);
+            const stored = this.db
+                .prepare("SELECT body_hash, ord, content_hash FROM ccr_bodies WHERE session_id = ?")
+                .all(sessionId) as Array<{ body_hash: string; ord: number; content_hash: string }>;
+            const kept = new Set<string>();
+            const released: string[] = [];
+            for (const r of stored) {
+                const inc = incoming.get(r.body_hash);
+                if (!inc) {
+                    this.db.prepare("DELETE FROM ccr_bodies WHERE session_id = ? AND body_hash = ?").run(sessionId, r.body_hash);
+                    released.push(r.content_hash);
+                    continue;
+                }
+                kept.add(r.body_hash);
+                if (r.ord !== inc.ord) {
+                    this.db.prepare("UPDATE ccr_bodies SET ord = ? WHERE session_id = ? AND body_hash = ?").run(inc.ord, sessionId, r.body_hash);
+                }
+            }
+            for (const b of input.ccrBodies ?? []) {
+                if (kept.has(b.hash)) continue;
+                const hash = this.putContent(b.text);
+                this.db
+                    .prepare("INSERT INTO ccr_bodies (session_id, body_hash, ord, content_hash) VALUES (?, ?, ?, ?)")
+                    .run(sessionId, b.hash, b.ord, hash);
+            }
+            for (const h of released) this.releaseContent(h);
+        }
+        if (input.metadataRows) {
+            const nodes = this.db
+                .prepare("SELECT key, parent, name, ord, kind, value_json FROM session_metadata WHERE session_id = ?")
+                .all(sessionId) as Array<{ key: string; parent: string; name: string; ord: number; kind: string; value_json: string | null }>;
+            const storedNode = new Map(nodes.map((n) => [n.key, n]));
+            const items = this.db
+                .prepare("SELECT key, item, ord, value_json FROM session_metadata_items WHERE session_id = ?")
+                .all(sessionId) as StoredMetadataItem[];
+            // Sorted here, not with ORDER BY: an SQL sort of every item row
+            // spills to a temp file on each save.
+            const storedItems = new Map<string, StoredMetadataItem[]>();
+            for (const it of items) {
+                let a = storedItems.get(it.key);
+                if (!a) storedItems.set(it.key, (a = []));
+                a.push(it);
+            }
+            for (const a of storedItems.values()) a.sort((x, y) => x.ord - y.ord);
+            const st = {
+                delItems: this.db.prepare("DELETE FROM session_metadata_items WHERE session_id = ? AND key = ?"),
+                delItem: this.db.prepare("DELETE FROM session_metadata_items WHERE session_id = ? AND key = ? AND item = ?"),
+                upItem: this.db.prepare(
+                    `INSERT INTO session_metadata_items (session_id, key, item, ord, value_json) VALUES (?, ?, ?, ?, ?)
+                     ON CONFLICT(session_id, key, item) DO UPDATE SET ord = excluded.ord, value_json = excluded.value_json`,
+                ),
+            };
+            const delNode = this.db.prepare("DELETE FROM session_metadata WHERE session_id = ? AND key = ?");
+            const upNode = this.db.prepare(
+                `INSERT INTO session_metadata (session_id, key, parent, name, ord, kind, value_json) VALUES (?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(session_id, key) DO UPDATE SET parent = excluded.parent, name = excluded.name, ord = excluded.ord,
+                   kind = excluded.kind, value_json = excluded.value_json`,
+            );
+            const incomingKeys = new Set(input.metadataRows.map((r) => r.key));
+            for (const n of nodes) {
+                if (incomingKeys.has(n.key)) continue;
+                delNode.run(sessionId, n.key);
+                st.delItems.run(sessionId, n.key);
+            }
+            for (const r of input.metadataRows) {
+                const old = storedNode.get(r.key);
+                if (!old || old.parent !== r.parent || old.name !== r.name || old.ord !== r.ord || old.kind !== r.kind || old.value_json !== r.valueJson) {
+                    upNode.run(sessionId, r.key, r.parent, r.name, r.ord, r.kind, r.valueJson);
+                }
+                let have = storedItems.get(r.key) ?? [];
+                if (old && old.kind !== r.kind && have.length > 0) {
+                    st.delItems.run(sessionId, r.key);
+                    have = [];
+                }
+                if (r.kind === "a") this.writeArrayItems(sessionId, r.key, have, r.items, st);
+                else if (r.kind === "o") this.writeMapItems(sessionId, r.key, have, r.items, st);
+                else if (have.length > 0) st.delItems.run(sessionId, r.key);
+            }
+        }
+    }
+
+    /** Arrays keep absolute positions: an append inserts only the new tail,
+     *  a head drop (bounded ring) deletes only the dropped head. Anything
+     *  else rewrites the array's rows. */
+    private writeArrayItems(sessionId: string, key: string, have: StoredMetadataItem[], incoming: MetadataTopRow["items"], st: MetadataItemStatements): void {
+        const n = have.length, m = incoming.length;
+        let d = -1;
+        if (n === 0) d = 0;
+        else if (m === 0) d = n;
+        else {
+            for (let c = 0, tries = 0; c < n && tries < 4; c++) {
+                if (have[c]!.value_json !== incoming[0]!.valueJson) continue;
+                tries++;
+                if (n - c > m) continue;
+                let same = true;
+                for (let i = c; i < n; i++) {
+                    if (have[i]!.value_json !== incoming[i - c]!.valueJson) { same = false; break; }
+                }
+                if (same) { d = c; break; }
+            }
+        }
+        if (d < 0) {
+            st.delItems.run(sessionId, key);
+            for (let i = 0; i < m; i++) st.upItem.run(sessionId, key, String(i), i, incoming[i]!.valueJson);
+            return;
+        }
+        for (let i = 0; i < d; i++) st.delItem.run(sessionId, key, have[i]!.item);
+        let next = n > 0 ? have[n - 1]!.ord + 1 : 0;
+        for (let i = n - d; i < m; i++, next++) st.upItem.run(sessionId, key, String(next), next, incoming[i]!.valueJson);
+    }
+
+    /** Maps keep stored order numbers while the incoming key order agrees
+     *  with them (new keys appended at the end); otherwise renumber. */
+    private writeMapItems(sessionId: string, key: string, have: StoredMetadataItem[], incoming: MetadataTopRow["items"], st: MetadataItemStatements): void {
+        const old = new Map(have.map((h) => [h.item, h]));
+        const incomingSet = new Set(incoming.map((i) => i.item));
+        for (const h of have) if (!incomingSet.has(h.item)) st.delItem.run(sessionId, key, h.item);
+        let lastOrd = -1, sawNew = false, orderOk = true;
+        for (const it of incoming) {
+            const o = old.get(it.item);
+            if (!o) { sawNew = true; continue; }
+            if (sawNew || o.ord <= lastOrd) { orderOk = false; break; }
+            lastOrd = o.ord;
+        }
+        if (!orderOk) {
+            incoming.forEach((it, i) => {
+                const o = old.get(it.item);
+                if (!o || o.ord !== i || o.value_json !== it.valueJson) st.upItem.run(sessionId, key, it.item, i, it.valueJson);
+            });
+            return;
+        }
+        let next = (have.length > 0 ? have[have.length - 1]!.ord : -1) + 1;
+        for (const it of incoming) {
+            const o = old.get(it.item);
+            if (!o) st.upItem.run(sessionId, key, it.item, next++, it.valueJson);
+            else if (o.value_json !== it.valueJson) st.upItem.run(sessionId, key, it.item, o.ord, it.valueJson);
+        }
+    }
+
+    /** #5599 prototype: exact original metadata JSON from the side tables. */
+    private assembleMetadataJson(sessionId: string): string {
+        const nodes = this.db
+            .prepare("SELECT key, parent, name, kind, value_json FROM session_metadata WHERE session_id = ? ORDER BY ord")
+            .all(sessionId) as Array<{ key: string; parent: string; name: string; kind: string; value_json: string | null }>;
+        const items = this.db
+            .prepare("SELECT key, item, ord, value_json FROM session_metadata_items WHERE session_id = ?")
+            .all(sessionId) as Array<{ key: string; item: string; ord: number; value_json: string }>;
+        const children = new Map<string, typeof nodes>();
+        for (const n of nodes) {
+            let a = children.get(n.parent);
+            if (!a) children.set(n.parent, (a = []));
+            a.push(n);
+        }
+        const byKey = new Map<string, Array<{ item: string; ord: number; value_json: string }>>();
+        for (const it of items) {
+            let a = byKey.get(it.key);
+            if (!a) byKey.set(it.key, (a = []));
+            a.push(it);
+        }
+        for (const a of byKey.values()) a.sort((x, y) => x.ord - y.ord);
+        const renderObject = (parent: string): string =>
+            "{" + (children.get(parent) ?? []).map((n) => JSON.stringify(n.name) + ":" + renderNode(n)).join(",") + "}";
+        const renderNode = (n: (typeof nodes)[number]): string => {
+            const its = byKey.get(n.key) ?? [];
+            if (n.kind === "n") return renderObject(n.key);
+            if (n.kind === "a") return "[" + its.map((i) => i.value_json).join(",") + "]";
+            if (n.kind === "o") return "{" + its.map((i) => JSON.stringify(i.item) + ":" + i.value_json).join(",") + "}";
+            return n.value_json ?? "null";
+        };
+        return renderObject("");
+    }
+
+    /** #5599 prototype: exact original CCR store JSON from the side tables. */
+    private assembleCcrJson(sessionId: string): string {
+        const bodies = this.db
+            .prepare("SELECT b.body_hash AS h, c.bytes AS bytes FROM ccr_bodies b JOIN content c ON c.hash = b.content_hash WHERE b.session_id = ? ORDER BY b.ord")
+            .all(sessionId) as Array<{ h: string; bytes: Uint8Array }>;
+        const entries = this.db
+            .prepare("SELECT e.ccr_key AS k, c.bytes AS bytes FROM ccr_entries e JOIN content c ON c.hash = e.content_hash WHERE e.session_id = ? ORDER BY e.ord")
+            .all(sessionId) as Array<{ k: string; bytes: Uint8Array }>;
+        const utf8 = (b: Uint8Array): string => Buffer.from(b).toString("utf8");
+        return '{"version":1,"byHash":{'
+            + bodies.map((b) => JSON.stringify(b.h) + ":" + JSON.stringify(utf8(b.bytes))).join(",")
+            + '},"byRef":{'
+            + entries.map((e) => JSON.stringify(e.k) + ":" + utf8(e.bytes)).join(",")
+            + "}}";
+    }
+
+    private materializeMetadataJson(sessionId: string, column: string): string {
+        return column === SPLIT_METADATA_MARKER ? this.assembleMetadataJson(sessionId) : column;
+    }
+
+    private materializeCcrJson(sessionId: string, column: string | null): string | null {
+        return column === SPLIT_CCR_MARKER ? this.assembleCcrJson(sessionId) : column;
     }
 
     /** #3250: cadence-tick WAL reclamation (see WAL_CHECKPOINT_EVERY_INGESTS).
@@ -1959,6 +2237,12 @@ export class UnifiedStore {
             for (const e of this.db
                 .prepare("SELECT content_hash FROM ccr_entries WHERE session_id = ?")
                 .all(sessionId) as { content_hash: string }[]) refs.push(e.content_hash);
+            for (const b of this.db
+                .prepare("SELECT content_hash FROM ccr_bodies WHERE session_id = ?")
+                .all(sessionId) as { content_hash: string }[]) refs.push(b.content_hash);
+            this.db.prepare("DELETE FROM ccr_bodies WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM session_metadata WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM session_metadata_items WHERE session_id = ?").run(sessionId);
             // Checkpoints: pinned replicas keep their rows + CAS refcounts; the
             // rest die with the session.
             for (const cp of this.db
@@ -2032,6 +2316,7 @@ export class UnifiedStore {
                     UNION ALL SELECT summary_hash, 1 FROM blocks WHERE session_id = ?
                     UNION ALL SELECT one_hash, 1 FROM blocks WHERE session_id = ? AND one_hash IS NOT NULL
                     UNION ALL SELECT content_hash, 1 FROM ccr_entries WHERE session_id = ?
+                    UNION ALL SELECT content_hash, 1 FROM ccr_bodies WHERE session_id = ?
                     UNION ALL SELECT state_hash, CASE WHEN pinned = 0 THEN 1 ELSE 0 END FROM checkpoints WHERE session_id = ?
                  ), releases AS (SELECT hash, SUM(released) AS n FROM owned_refs GROUP BY hash)
                  SELECT COALESCE(SUM(CASE WHEN r.n > 0 AND c.refcount <= r.n THEN c.byte_len ELSE 0 END), 0) AS exclusiveBytes,
@@ -2039,7 +2324,7 @@ export class UnifiedStore {
                         COALESCE(SUM(CASE WHEN c.refcount > r.n THEN 1 ELSE 0 END), 0) AS sharedBlobs
                    FROM releases r JOIN content c ON c.hash = r.hash`,
             )
-            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as { exclusiveBytes: number; exclusiveBlobs: number; sharedBlobs: number };
+            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as { exclusiveBytes: number; exclusiveBlobs: number; sharedBlobs: number };
         return {
             rows: {
                 sessions: counts.sessions,
@@ -2202,6 +2487,12 @@ export class UnifiedStore {
             for (const mm of mediaMaps) rel.push(mm.media_hash as string);
             for (const b of blocks) { rel.push(b.summary_hash as string); if (b.one_hash !== null && b.one_hash !== undefined) rel.push(b.one_hash as string); }
             for (const e of ccr) rel.push(e.content_hash as string);
+            for (const b of this.db
+                .prepare("SELECT content_hash FROM ccr_bodies WHERE session_id = ?")
+                .all(sessionId) as { content_hash: string }[]) rel.push(b.content_hash);
+            this.db.prepare("DELETE FROM ccr_bodies WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM session_metadata WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM session_metadata_items WHERE session_id = ?").run(sessionId);
             for (const cp of checkpoints) if (cp.pinned === 0) { rel.push(cp.state_hash as string); this.db.prepare("DELETE FROM checkpoints WHERE cp_id = ?").run(cp.cp_id); }
             this.db.prepare("DELETE FROM messages WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM message_media WHERE session_id = ?").run(sessionId);
@@ -3013,7 +3304,7 @@ export class UnifiedStore {
             status: r.status,
             updatedAt: r.updatedAt,
             statsJson: r.statsJson,
-            metadataJson: r.metadataJson,
+            metadataJson: this.materializeMetadataJson(r.sessionId, r.metadataJson),
             blocks: r.blocks,
             firstTopic: r.firstTopic,
             firstSummary: r.firstSummary,
@@ -3064,7 +3355,7 @@ export class UnifiedStore {
     getMetadataJson(sessionId: string): string | null {
         const row = this.db.prepare("SELECT metadata_json FROM sessions WHERE session_id = ?")
             .get(sessionId) as { metadata_json: string } | undefined;
-        return row?.metadata_json ?? null;
+        return row ? this.materializeMetadataJson(sessionId, row.metadata_json) : null;
     }
 
     getOrphansJson(sessionId: string): string | null {
@@ -3148,10 +3439,10 @@ export class UnifiedStore {
             nextRunId: row.next_run_id as number,
             metaJson: row.meta_json as string,
             statsJson: row.stats_json as string,
-            metadataJson: row.metadata_json as string,
+            metadataJson: this.materializeMetadataJson(sessionId, row.metadata_json as string),
             kstateJson: row.kstate_json as string,
             tailJson: row.tail_json as string,
-            ccrJson: (row.ccr_json as string | null) ?? null,
+            ccrJson: this.materializeCcrJson(sessionId, (row.ccr_json as string | null) ?? null),
             lastIngestedSeq: (row.last_ingested_seq as number | null | undefined) ?? null,
             orphansJson: (row.orphans_json as string | null | null | undefined) ?? null,
         };
@@ -3486,7 +3777,7 @@ export class UnifiedStore {
             .prepare("SELECT metadata_json FROM sessions WHERE session_id = ?")
             .get(sessionId) as { metadata_json: string } | undefined;
         if (!row) return null;
-        return JSON.parse(row.metadata_json) as Record<string, unknown>;
+        return JSON.parse(this.materializeMetadataJson(sessionId, row.metadata_json)) as Record<string, unknown>;
     }
 
     /** #3762: swap {"$media": hash} references back to the CAS bytes. Only
@@ -3595,7 +3886,7 @@ export class UnifiedStore {
             .get(sessionId) as { ccr_json: string | null } | undefined;
         if (!row || row.ccr_json === null) return null;
         try {
-            const parsed = JSON.parse(row.ccr_json) as MessageContentStore;
+            const parsed = JSON.parse(this.materializeCcrJson(sessionId, row.ccr_json) ?? "null") as MessageContentStore;
             if (parsed && typeof parsed === "object" && parsed.version === 1
                 && parsed.byHash && typeof parsed.byHash === "object"
                 && parsed.byRef && typeof parsed.byRef === "object") {

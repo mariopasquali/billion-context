@@ -28,7 +28,7 @@
 import type { CoreMessage, CompressionBlock } from "../../kernel/src/types.js";
 import type { BlockView } from "../session.js";
 import { refToIndex } from "../../kernel/src/refs.js";
-import { sha256Hex, type BlockRow, type CcrEntryRow, type IngestSessionInput, type MessageRow, type RefRow, type SessionRow } from "./store.js";
+import { sha256Hex, SPLIT_CCR_MARKER, SPLIT_METADATA_MARKER, type BlockRow, type CcrBodyRow, type CcrEntryRow, type IngestSessionInput, type MessageRow, type MetadataTopRow, type RefRow, type SessionRow } from "./store.js";
 import { splitMediaContent, identityOfStoredContent } from "./identity.js";
 
 /**
@@ -360,6 +360,68 @@ export function planIngestDelta(
  *  fast path must not change what a full ingest would write. (#4182: the
  *  duplicate-identity case feeds this function DIFFERENT logs by design;
  *  see planIngestDelta's strict-append precondition.) */
+/** #5599 prototype: arrays/plain objects with more than this many elements
+ *  get one row per element, so growth appends rows instead of rewriting the
+ *  whole value. Smaller values stay one row. */
+const METADATA_SPLIT_MIN_ELEMENTS = 32;
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+    if (v === null || typeof v !== "object" || Array.isArray(v)) return false;
+    const proto = Object.getPrototypeOf(v);
+    return (proto === Object.prototype || proto === null) && typeof (v as { toJSON?: unknown }).toJSON !== "function";
+}
+
+/** Large bags can sit below a small wrapper (cacheLedger.lines,
+ *  foldPositions.ids). Wrappers down to this depth become "n" nodes. */
+const METADATA_SPLIT_MAX_DEPTH = 3;
+
+function isBag(v: unknown): boolean {
+    if (Array.isArray(v)) return v.length > METADATA_SPLIT_MIN_ELEMENTS;
+    return isPlainObject(v) && Object.keys(v).length > METADATA_SPLIT_MIN_ELEMENTS;
+}
+
+function containsBag(v: unknown, depth: number): boolean {
+    if (!isPlainObject(v) || depth > METADATA_SPLIT_MAX_DEPTH) return false;
+    for (const c of Object.values(v)) if (isBag(c) || containsBag(c, depth + 1)) return true;
+    return false;
+}
+
+function splitMetadata(metadata: Record<string, unknown>): MetadataTopRow[] {
+    const out: MetadataTopRow[] = [];
+    const walk = (obj: Record<string, unknown>, parent: string, depth: number): void => {
+        for (const [name, value] of Object.entries(obj)) {
+            const key = parent === "" ? JSON.stringify(name) : `${parent}.${JSON.stringify(name)}`;
+            if (Array.isArray(value) && value.length > METADATA_SPLIT_MIN_ELEMENTS) {
+                out.push({
+                    key, parent, name, ord: out.length, kind: "a", valueJson: null,
+                    items: value.map((v, i) => ({ item: String(i), ord: i, valueJson: JSON.stringify(v) ?? "null" })),
+                });
+                continue;
+            }
+            if (isPlainObject(value) && Object.keys(value).length > METADATA_SPLIT_MIN_ELEMENTS) {
+                const items: MetadataTopRow["items"] = [];
+                for (const [item, v] of Object.entries(value)) {
+                    const j = JSON.stringify(v);
+                    if (j === undefined) continue;
+                    items.push({ item, ord: items.length, valueJson: j });
+                }
+                out.push({ key, parent, name, ord: out.length, kind: "o", valueJson: null, items });
+                continue;
+            }
+            if (isPlainObject(value) && depth < METADATA_SPLIT_MAX_DEPTH && containsBag(value, depth + 1)) {
+                out.push({ key, parent, name, ord: out.length, kind: "n", valueJson: null, items: [] });
+                walk(value, key, depth + 1);
+                continue;
+            }
+            const j = JSON.stringify(value);
+            if (j === undefined) continue;
+            out.push({ key, parent, name, ord: out.length, kind: "v", valueJson: j, items: [] });
+        }
+    };
+    walk(metadata, "", 0);
+    return out;
+}
+
 function finishPlan(
     session: LegacySessionLike,
     byRawRef: Record<string, string>,
@@ -499,13 +561,17 @@ function finishPlan(
         nextRunId: session.state.nextRunId,
         metaJson: JSON.stringify(session.meta),
         statsJson: JSON.stringify(session.stats),
-        metadataJson: JSON.stringify(session.metadata),
+        metadataJson: SPLIT_METADATA_MARKER,
         kstateJson: JSON.stringify(kstate),
         tailJson: JSON.stringify({ pluginSnapshotSeqs, tailSeqs, tailFolded: session.lastMessagesFolded === true }),
-        ccrJson: session.contentStore ? JSON.stringify(session.contentStore) : null,
+        ccrJson: session.contentStore ? SPLIT_CCR_MARKER : null,
     };
+    const ccrBodies: CcrBodyRow[] = session.contentStore
+        ? Object.entries(session.contentStore.byHash).map(([hash, text], ord) => ({ ord, hash, text }))
+        : [];
+    const metadataRows = splitMetadata(session.metadata);
 
-    return { session: sessionRow, messages, blocks, deadRefs, refs, ccrEntries, pluginSnapshotSeqs, tailSeqs };
+    return { session: sessionRow, messages, blocks, deadRefs, refs, ccrEntries, ccrBodies, metadataRows, pluginSnapshotSeqs, tailSeqs };
 }
 
 /** Rebuilds the legacy load view from unified rows alone. */
